@@ -1,0 +1,7 @@
+# _config.yml
+
+# Site settings
+title: GNN-based Reinforcement Learning for Robust TSN Routing
+description: A research project on robust network routing using Graph Attention Networks and Reinforcement Learning.
+theme: jekyll-theme-minimal
+
