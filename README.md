@@ -1,5 +1,4 @@
  
-````markdown
 # GNN-based Reinforcement Learning for Robust TSN Routing
 
 ![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)
