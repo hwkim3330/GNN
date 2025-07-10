@@ -1,43 +1,34 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv
-from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv, global_mean_pool
+from torch_geometric.data import Data, Batch
 import networkx as nx
 import random
 import numpy as np
 import time
-import copy # NameError 해결
+import copy
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
 from tqdm import tqdm
 from pulp import LpProblem, LpVariable, lpSum, LpMinimize, LpStatus, PULP_CBC_CMD
+import itertools
 
 # ==============================================================================
 # 0. 설정
 # ==============================================================================
 os.environ['OMP_NUM_THREADS'] = '8'; os.environ['MKL_NUM_THREADS'] = '8'; torch.set_num_threads(8)
 
-IMITATION_EPISODES = 1000
-ONLINE_EPISODES = 5000
+IMITATION_EPOCHS = 50
+IMITATION_DATASET_SIZE = 500
 IMITATION_LR = 1e-4
-ONLINE_LR_PPO = 3e-5
-ONLINE_LR_IMITATION = 5e-6
-ILP_TIME_LIMIT_SEC = 60
 BENCHMARK_SCENARIOS = 10
 DEVICE = torch.device("cpu")
 
-IMITATION_MODEL_PATH = "gnn_hop_by_hop_imitated.pth"
-CHECKPOINT_PATH = "gnn_hop_by_hop_checkpoint.pth"
-FINAL_MODEL_PATH = "gnn_hop_by_hop_final.pth"
-RESULT_PLOT_PATH = "benchmark_results_hop_by_hop.png"
-PREV_MODEL_PATH = IMITATION_MODEL_PATH if os.path.exists(IMITATION_MODEL_PATH) else None
-
-PPO_GAMMA = 0.99; PPO_GAE_LAMBDA = 0.95; PPO_CLIP_EPS = 0.2
-PPO_EPOCHS_UPDATE = 4; PPO_CRITIC_COEF = 0.5; PPO_ENTROPY_COEF = 0.01
-REWARD_PER_STEP = -0.01
-GRADIENT_CLIP_NORM = 1.0
+MODEL_PATH = "gnn_path_scorer_final.pth"
+RESULT_PLOT_PATH = "benchmark_results_path_scorer.png"
+K_SHORTEST_PATHS = 5
 
 CORE_AGG_BANDWIDTH_BPS = 10e9
 AGG_EDGE_BANDWIDTH_BPS = 5e9
@@ -46,7 +37,7 @@ SWITCH_PROC_DELAY_NS = 1000
 PROPAGATION_DELAY_NS_PER_METER = 5
 
 # ==============================================================================
-# 1. 환경, 모델, 솔버 정의
+# 1. 환경 정의 (이전과 동일)
 # ==============================================================================
 class RealisticProfileGenerator:
     def _generate_fat_tree(self, k):
@@ -106,7 +97,7 @@ class RealisticTSNEnv:
             if path and nx.is_path(eval_graph, path):
                 rate_to_add = (self.flow_defs[flow_id]['size_bytes'] * 8) / (self.flow_defs[flow_id]['period_ms'] * 1e-3)
                 for u, v in zip(path[:-1], path[1:]): link_data_rate[tuple(sorted((u,v)))] += rate_to_add
-        link_utilization = {edge: rate / eval_graph.edges[edge]['bandwidth'] for edge, rate in link_data_rate.items()}
+        link_utilization = {edge: rate / eval_graph.edges[edge]['bandwidth'] for edge, rate in link_data_rate.items() if eval_graph.has_edge(*edge)}
         for edge, util in link_utilization.items():
             if util >= 1.0: return -1000, {"error": f"Bandwidth exceeded on link {edge} (util: {util:.2f})"}
         flow_results, total_path_len = {}, 0
@@ -141,120 +132,83 @@ class RealisticTSNEnv:
         resource_penalty = 1 + 0.001 * p_details.get("total_path_len", 0)
         return (0.7 * p_score + 0.3 * avg_c_score) / resource_penalty, {}
 
-class ActorCriticSAGE(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, dropout_rate=0.2):
-        super().__init__(); self.conv1 = SAGEConv(input_dim, hidden_dim); self.conv2 = SAGEConv(hidden_dim, hidden_dim)
-        self.dropout = nn.Dropout(p=dropout_rate); self.actor_head = nn.Linear(hidden_dim, 1); self.critic_head = nn.Linear(hidden_dim, 1)
-    def forward(self, x, edge_index):
-        x = F.relu(self.conv1(x, edge_index)); x = self.dropout(x); x = F.relu(self.conv2(x, edge_index))
-        return self.actor_head(x).squeeze(-1), self.critic_head(torch.mean(x, dim=0)).squeeze()
+# ==============================================================================
+# 2. 새로운 아키텍처: 경로 채점 GNN
+# ==============================================================================
+class PathScorerGNN(nn.Module):
+    def __init__(self, node_feature_dim, hidden_dim=64):
+        super().__init__()
+        self.gnn_encoder = nn.Sequential(SAGEConv(node_feature_dim, hidden_dim), nn.ReLU(), SAGEConv(hidden_dim, hidden_dim))
+        self.path_encoder = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        self.scorer_mlp = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+    def forward(self, network_batch_data, path_node_indices_list):
+        node_embeddings = self.gnn_encoder(network_batch_data.x, network_batch_data.edge_index)
+        graph_embedding = global_mean_pool(node_embeddings, network_batch_data.batch)
+        path_scores = []
+        for i, path_nodes in enumerate(path_node_indices_list):
+            path_node_embeddings = node_embeddings[path_nodes]
+            _, (hn, _) = self.path_encoder(path_node_embeddings.unsqueeze(0))
+            path_embedding = hn.squeeze(0)
+            combined_embedding = torch.cat([graph_embedding[i], path_embedding.squeeze(0)], dim=-1)
+            score = self.scorer_mlp(combined_embedding)
+            path_scores.append(score)
+        return torch.cat(path_scores)
 
-def get_state_tensor(graph, flow_props, partial_paths, all_flow_defs):
-    num_nodes = graph.number_of_nodes(); features = np.zeros((num_nodes, 6))
-    features[flow_props['src'], 0] = 1; features[flow_props['dst'], 1] = 1
+def get_network_state_tensor(graph, partial_paths, all_flow_defs):
+    num_nodes = graph.number_of_nodes(); features = np.zeros((num_nodes, 4))
     max_degree = max(d for _, d in graph.degree) if num_nodes > 1 else 1
-    if max_degree > 0: features[:, 2] = [d/max_degree for _, d in graph.degree]
+    if max_degree > 0: features[:, 0] = [d/max_degree for _, d in graph.degree]
     for i in range(num_nodes):
-        if i in graph.graph.get('core_switches', []): features[i, 3] = 3
-        elif i in graph.graph.get('agg_switches', []): features[i, 3] = 2
-        elif i in graph.graph.get('edge_switches', []): features[i, 3] = 1
+        if i in graph.graph.get('core_switches', []): features[i, 1] = 3
+        elif i in graph.graph.get('agg_switches', []): features[i, 1] = 2
+        elif i in graph.graph.get('edge_switches', []): features[i, 1] = 1
     max_bw = max(d['bandwidth'] for _, _, d in graph.edges(data=True)) if graph.edges else 1
     if max_bw > 0:
         for i in range(num_nodes):
-            if graph.degree(i) > 0: features[i, 4] = np.mean([graph.edges[i, nbr]['bandwidth'] for nbr in graph.neighbors(i)]) / max_bw
+            if graph.degree(i) > 0: features[i, 2] = np.mean([graph.edges[i, nbr]['bandwidth'] for nbr in graph.neighbors(i)]) / max_bw
     link_data_rate = {tuple(sorted(e)): 0.0 for e in graph.edges}
     if partial_paths:
         for flow_id, path_pair in partial_paths.items():
             if (flow_info := all_flow_defs.get(flow_id)):
                 rate = (flow_info['size_bytes'] * 8) / (flow_info['period_ms'] * 1e-3)
-                for path in [path_pair.get('primary'), path_pair.get('backup')]:
-                    if path: [link_data_rate.update({tuple(sorted(e)): link_data_rate.get(tuple(sorted(e)), 0) + rate}) for e in zip(path[:-1], path[1:])]
+                if (path := path_pair.get('primary')):
+                    for u, v in zip(path[:-1], path[1:]): link_data_rate[tuple(sorted((u,v)))] += rate
     node_utilization = np.zeros(num_nodes)
     for u, v in graph.edges:
         edge, bw = tuple(sorted((u,v))), graph.edges[u,v]['bandwidth']
         util = link_data_rate.get(edge, 0) / bw if bw > 0 else 0
         node_utilization[u] += util; node_utilization[v] += util
-    features[:, 5] = node_utilization
+    features[:, 3] = node_utilization
     return Data(x=torch.tensor(features, dtype=torch.float), edge_index=torch.tensor(list(graph.edges), dtype=torch.long).t().contiguous())
 
-class SAGE_PPOAgent:
-    def __init__(self, state_dim, lr):
-        self.policy_net = ActorCriticSAGE(state_dim).to(DEVICE)
-        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.memory = []
-    def set_optimizer_lr(self, lr): self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=lr)
-    def clear_memory(self): self.memory = []
-    def store_experience(self, state, action, log_prob, value): self.memory.append({"state": state, "action": action, "log_prob": log_prob, "value": value})
-    def _select_action_internal(self, state_data, current_path, graph, is_eval=False):
-        with torch.set_grad_enabled(not is_eval):
-            logits, value = self.policy_net(state_data.x.to(DEVICE), state_data.edge_index.to(DEVICE))
-        mask = torch.ones_like(logits) * -1e9
-        valid_neighbors = [n for n in graph.neighbors(current_path[-1]) if n not in current_path]
-        if not valid_neighbors: return None, None, None
-        mask[valid_neighbors] = 0; masked_logits = logits + mask
-        dist = torch.distributions.Categorical(logits=masked_logits)
-        action = dist.sample() if not is_eval else masked_logits.argmax()
-        return action.item(), dist.log_prob(action), value
-    def find_path(self, graph, props, partial_paths, all_flow_defs, is_eval):
-        path, failed = [props['src']], False
-        while path[-1] != props['dst']:
-            state = get_state_tensor(graph, {'src': path[-1], 'dst': props['dst']}, partial_paths, all_flow_defs)
-            action, log_prob, value = self._select_action_internal(state, path, graph, is_eval=is_eval)
-            if action is None or len(path) > graph.number_of_nodes(): failed = True; break
-            if not is_eval: self.store_experience(state, action, log_prob, value)
-            path.append(action)
-        return (None, True) if failed else (path, False)
-    def update(self, final_reward):
-        if not self.memory: return 0, 0, 0
-        rewards, advantages, gae, next_value = [REWARD_PER_STEP] * (len(self.memory) - 1) + [final_reward], [], 0, 0
-        for i in reversed(range(len(rewards))):
-            delta = rewards[i] + PPO_GAMMA * next_value - self.memory[i]['value']
-            gae = delta + PPO_GAMMA * PPO_GAE_LAMBDA * gae; advantages.insert(0, gae); next_value = self.memory[i]['value'].detach()
-        advantages = torch.tensor(advantages, dtype=torch.float, device=DEVICE)
-        if advantages.numel() > 1: advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        old_states, old_actions = [m['state'] for m in self.memory], torch.tensor([m['action'] for m in self.memory], dtype=torch.long, device=DEVICE)
-        old_log_probs, old_values = torch.stack([m['log_prob'] for m in self.memory]).detach(), torch.stack([m['value'] for m in self.memory]).detach()
-        returns = advantages + old_values
-        for _ in range(PPO_EPOCHS_UPDATE):
-            new_log_probs, new_values, entropies = [], [], []
-            for i, state in enumerate(old_states):
-                logits, value = self.policy_net(state.x.to(DEVICE), state.edge_index.to(DEVICE))
-                dist = torch.distributions.Categorical(logits=logits); new_log_probs.append(dist.log_prob(old_actions[i])); new_values.append(value); entropies.append(dist.entropy())
-            new_log_probs, new_values, entropy = torch.stack(new_log_probs), torch.stack(new_values), torch.stack(entropies).mean()
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            surr1, surr2 = ratio * advantages, torch.clamp(ratio, 1 - PPO_CLIP_EPS, 1 + PPO_CLIP_EPS) * advantages
-            policy_loss, value_loss = -torch.min(surr1, surr2).mean(), F.mse_loss(new_values, returns)
-            loss = policy_loss + PPO_CRITIC_COEF * value_loss - PPO_ENTROPY_COEF * entropy
-            self.optimizer.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), GRADIENT_CLIP_NORM); self.optimizer.step()
-        self.clear_memory(); return policy_loss.item(), value_loss.item(), entropy.item()
-    def update_imitation(self, expert_path, graph, partial_paths, all_flow_defs, loss_fn):
-        if not expert_path or len(expert_path) < 2: return 0
-        total_loss = 0
-        for j in range(len(expert_path) - 1):
-            state = get_state_tensor(graph, {'src': expert_path[j], 'dst': expert_path[-1]}, partial_paths, all_flow_defs)
-            logits, _ = self.policy_net(state.x.to(DEVICE), state.edge_index.to(DEVICE))
-            loss = loss_fn(logits.unsqueeze(0), torch.tensor([expert_path[j+1]], device=DEVICE))
-            self.optimizer.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), GRADIENT_CLIP_NORM); self.optimizer.step()
-            total_loss += loss.item()
-        return total_loss
-
+# ==============================================================================
+# 3. 솔버 정의
+# ==============================================================================
 class BaseSolver:
     def __init__(self, name): self.name = name; self.solve_time = 0
     def solve(self, env, profile): raise NotImplementedError
 
-class GNN_SAGE_Solver(BaseSolver):
+class GNN_Path_Scorer_Solver(BaseSolver):
     def __init__(self, model_path):
-        super().__init__("GNN-SAGE"); self.agent = SAGE_PPOAgent(state_dim=6, lr=0)
-        if os.path.exists(model_path): self.agent.policy_net.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        super().__init__("GNN-PathScorer")
+        self.model = PathScorerGNN(node_feature_dim=4).to(DEVICE)
+        if os.path.exists(model_path): self.model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        self.model.eval()
     def solve(self, env, profile):
         paths, partial_paths = {}, {}
-        for flow_id, props in sorted(profile['flow_definitions'].items(), key=lambda item: item[1]['period_ms']):
-            p_path, _ = self.agent.find_path(env.graph, props, partial_paths, profile['flow_definitions'], is_eval=True)
-            backup_graph = env.graph.copy()
-            if p_path and len(p_path) > 1: backup_graph.remove_edges_from(list(zip(p_path[:-1], p_path[1:])))
-            b_path = None
-            if nx.has_path(backup_graph, props['src'], props['dst']):
-                b_path, _ = self.agent.find_path(backup_graph, props, partial_paths, profile['flow_definitions'], is_eval=True)
+        graph, all_flow_defs = env.graph, profile['flow_definitions']
+        for flow_id, props in sorted(all_flow_defs.items(), key=lambda item: item[1]['period_ms']):
+            src, dst = props['src'], props['dst']
+            try: candidate_paths = list(itertools.islice(nx.shortest_simple_paths(graph, src, dst), K_SHORTEST_PATHS))
+            except nx.NetworkXNoPath: return None
+            if not candidate_paths: continue
+            net_state = get_network_state_tensor(graph, partial_paths, all_flow_defs)
+            path_node_indices_list = [torch.tensor(p, dtype=torch.long) for p in candidate_paths]
+            with torch.no_grad(): scores = self.model(Batch.from_data_list([net_state] * len(candidate_paths)), path_node_indices_list)
+            best_path_idx = torch.argmax(scores).item()
+            p_path = candidate_paths[best_path_idx]
+            backup_graph = graph.copy(); backup_graph.remove_edges_from(list(zip(p_path[:-1], p_path[1:])))
+            b_path = next(itertools.islice(nx.shortest_simple_paths(backup_graph, src, dst), 1), None) if nx.has_path(backup_graph, src, dst) else None
             paths[flow_id] = {'primary': p_path, 'backup': b_path}; partial_paths[flow_id] = paths[flow_id]
         return paths
 
@@ -277,95 +231,75 @@ class Greedy_Solver(BaseSolver):
             except (nx.NetworkXNoPath, nx.NetworkXUnfeasible): return None
         return paths
 
-class ILP_Solver(BaseSolver):
-    def __init__(self, time_limit_sec): super().__init__("ILP"); self.time_limit = time_limit_sec
-    def solve(self, env, profile):
-        prob, G, flow_defs = LpProblem("TSN_Routing_BW", LpMinimize), env.graph, profile['flow_definitions']
-        all_directed_edges = list(G.edges()) + [(v, u) for u, v in G.edges()]
-        p_vars = {f: {e: LpVariable(f"p_{f}_{e[0]}_{e[1]}", 0, 1, 'Binary') for e in all_directed_edges} for f in flow_defs}
-        prob += lpSum(p_vars[f][e] for f in flow_defs for e in all_directed_edges), "Minimize_Path_Length"
-        for u, v in G.edges():
-            prob += lpSum((flow_defs[f]['size_bytes'] * 8 / (flow_defs[f]['period_ms'] * 1e-3)) * (p_vars[f][(u,v)] + p_vars[f][(v,u)]) for f in flow_defs) <= G.edges[u,v]['bandwidth']
-        for f, props in flow_defs.items():
-            src, dst = props['src'], props['dst']
-            for node in G.nodes():
-                in_flow = lpSum(p_vars[f][(i, node)] for i in G.neighbors(node))
-                out_flow = lpSum(p_vars[f][(node, j)] for j in G.neighbors(node))
-                if node == src: prob += out_flow - in_flow == 1
-                elif node == dst: prob += in_flow - out_flow == 1
-                else: prob += out_flow - in_flow == 0
-        prob.solve(PULP_CBC_CMD(msg=0, timeLimit=self.time_limit))
-        if LpStatus[prob.status] != 'Optimal': return None
-        paths = {}
-        for f, props in flow_defs.items():
-            src, dst = props['src'], props['dst']; p_path, curr_p = [src], src
-            while curr_p != dst and len(p_path) <= G.number_of_nodes():
-                next_node = next((v for u, v in all_directed_edges if u == curr_p and p_vars[f][(u,v)].varValue > 0.9), None)
-                if next_node is None: break
-                p_path.append(next_node); curr_p = next_node
-            if not p_path or p_path[-1] != dst: return None
-            backup_graph = G.copy(); backup_graph.remove_edges_from(list(zip(p_path[:-1], p_path[1:])))
-            b_path = nx.shortest_path(backup_graph, src, dst) if nx.has_path(backup_graph, src, dst) else None
-            paths[f] = {'primary': p_path, 'backup': b_path}
-        return paths
-
-def run_imitation_learning(agent, expert_solver, profile_generator, episodes):
-    print("\n===== 1단계: 전문가 모방 학습 시작 ====="); agent.set_optimizer_lr(IMITATION_LR); loss_fn = nn.CrossEntropyLoss()
-    for ep in tqdm(range(episodes), desc="모방 학습", ncols=100):
+# ==============================================================================
+# 4. 새로운 학습 파이프라인
+# ==============================================================================
+def generate_imitation_dataset(profile_generator, env_class, num_episodes):
+    dataset = []
+    print("모방 학습을 위한 전문가 데이터셋 생성 중...")
+    for _ in tqdm(range(num_episodes), desc="데이터셋 생성"):
         profile = profile_generator.generate()
-        env = RealisticTSNEnv(profile["graph"], profile['flow_definitions'])
-        expert_paths = expert_solver.solve(env, profile)
-        if not expert_paths: continue
-        partial_paths, total_loss = {}, 0
-        for flow_id in sorted(profile['flow_definitions'].keys(), key=lambda k: profile['flow_definitions'][k]['period_ms']):
-            if (expert_path := expert_paths.get(flow_id, {}).get('primary')):
-                loss = agent.update_imitation(expert_path, env.graph, partial_paths, profile['flow_definitions'], loss_fn)
-                total_loss += loss
-            partial_paths[flow_id] = expert_paths.get(flow_id, {})
-        tqdm.write(f"에피소드 {ep+1} 완료, 총 손실: {total_loss:.4f}")
-    torch.save(agent.policy_net.state_dict(), IMITATION_MODEL_PATH)
+        env = env_class(profile['graph'], profile['flow_definitions'])
+        partial_paths = {}
+        for flow_id, props in sorted(profile['flow_definitions'].items(), key=lambda item: item[1]['period_ms']):
+            src, dst = props['src'], props['dst']
+            try: candidate_paths = list(itertools.islice(nx.shortest_simple_paths(env.graph, src, dst), K_SHORTEST_PATHS))
+            except nx.NetworkXNoPath: continue
+            if not candidate_paths: continue
+            candidate_scores = []
+            for candidate_path in candidate_paths:
+                temp_paths = copy.deepcopy(partial_paths)
+                temp_paths[flow_id] = {'primary': candidate_path}
+                score, _ = env.evaluate_robust_configuration(temp_paths, profile['deadlines_ms'], profile['contingency_scenarios'])
+                candidate_scores.append(score)
+            if max(candidate_scores) <= 0: continue
+            net_state_tensor = get_network_state_tensor(env.graph, partial_paths, profile['flow_definitions'])
+            dataset.append({'net_state': net_state_tensor, 'candidates': candidate_paths, 'scores': torch.tensor(candidate_scores, dtype=torch.float)})
+            best_path = candidate_paths[np.argmax(candidate_scores)]
+            partial_paths[flow_id] = {'primary': best_path}
+    return dataset
 
-def run_ppo_guided_rl(agent, ilp_solver, profile_generator, episodes):
-    print("\n===== 2단계: PPO 온라인 학습 시작 =====")
-    start_episode = 0
-    if os.path.exists(CHECKPOINT_PATH):
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-        agent.policy_net.load_state_dict(checkpoint['model_state_dict']); start_episode = checkpoint['episode']
-    elif PREV_MODEL_PATH: agent.policy_net.load_state_dict(torch.load(PREV_MODEL_PATH, map_location=DEVICE))
-    pbar, il_loss_fn = tqdm(range(start_episode, episodes), desc="온라인 학습", ncols=100, initial=start_episode, total=episodes), nn.CrossEntropyLoss()
-    for ep in pbar:
-        profile = profile_generator.generate(); env = RealisticTSNEnv(profile["graph"], profile['flow_definitions'])
-        ilp_paths = ilp_solver.solve(env, profile)
-        score_ilp = env.evaluate_robust_configuration(ilp_paths, profile['deadlines_ms'], profile['contingency_scenarios'])[0] if ilp_paths else 0.0
-        agent.clear_memory(); paths, partial_paths, failed = {}, {}, False
-        for flow_id, props in sorted(profile['flow_definitions'].items(), key=lambda k: profile['flow_definitions'][k]['period_ms']):
-            p_path, p_failed = agent.find_path(env.graph, props, partial_paths, profile['flow_definitions'], is_eval=False)
-            if p_failed: failed=True; break
-            backup_graph = env.graph.copy()
-            if p_path and len(p_path) > 1: backup_graph.remove_edges_from(list(zip(p_path[:-1], p_path[1:])))
-            b_path, _ = (agent.find_path(backup_graph, props, partial_paths, profile['flow_definitions'], is_eval=False)) if nx.has_path(backup_graph, props['src'], props['dst']) else (None, False)
-            paths[flow_id] = {'primary': p_path, 'backup': b_path}; partial_paths[flow_id] = paths[flow_id]
-        if not failed:
-            score_rl, _ = env.evaluate_robust_configuration(paths, profile['deadlines_ms'], profile['contingency_scenarios'])
-            if score_rl > 0:
-                agent.set_optimizer_lr(ONLINE_LR_PPO); agent.update(final_reward=score_rl)
-                pbar.set_postfix(Action="PPO", Score=f"{score_rl:.3f}")
-                if score_rl < score_ilp and ilp_paths:
-                    agent.set_optimizer_lr(ONLINE_LR_IMITATION)
-                    for f_id in sorted(ilp_paths.keys()):
-                        if (p_path := ilp_paths.get(f_id, {}).get('primary')): agent.update_imitation(p_path, env.graph, {}, profile['flow_definitions'], il_loss_fn)
-        else: agent.clear_memory()
-        if (ep + 1) % 100 == 0: torch.save({'episode': ep + 1, 'model_state_dict': agent.policy_net.state_dict()}, CHECKPOINT_PATH)
+def run_imitation_learning(model, optimizer, dataset, epochs):
+    print("\n===== 경로 채점기(Path Scorer) 모방 학습 시작 =====")
+    loss_fn = nn.MSELoss()
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0; random.shuffle(dataset)
+        pbar = tqdm(dataset, desc=f"Epoch {epoch+1}/{epochs}", ncols=100)
+        for data_point in pbar:
+            optimizer.zero_grad()
+            net_states = [data_point['net_state']] * len(data_point['candidates'])
+            path_node_indices = [torch.tensor(p, dtype=torch.long) for p in data_point['candidates']]
+            target_scores = data_point['scores'].to(DEVICE)
+            predicted_scores = model(Batch.from_data_list(net_states), path_node_indices)
+            loss = loss_fn(predicted_scores, target_scores)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.6f}")
+        print(f"Epoch {epoch+1} 완료, 평균 손실: {total_loss / len(dataset):.6f}")
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"학습 완료. 모델 저장: {MODEL_PATH}")
 
+# ==============================================================================
+# 5. 메인 실행 함수
+# ==============================================================================
 def run_full_procedure_and_benchmark():
-    agent = SAGE_PPOAgent(state_dim=6, lr=IMITATION_LR); expert_solver = ILP_Solver(time_limit_sec=ILP_TIME_LIMIT_SEC)
     profile_gen = RealisticProfileGenerator()
-    if not os.path.exists(IMITATION_MODEL_PATH): run_imitation_learning(agent, expert_solver, profile_gen, episodes=IMITATION_EPISODES)
-    else: agent.policy_net.load_state_dict(torch.load(IMITATION_MODEL_PATH, map_location=DEVICE))
-    run_ppo_guided_rl(agent, expert_solver, profile_gen, episodes=ONLINE_EPISODES)
-    torch.save(agent.policy_net.state_dict(), FINAL_MODEL_PATH)
-    print("\n===== 최종 랜덤 벤치마크 실행 =====")
-    solvers = [GNN_SAGE_Solver(FINAL_MODEL_PATH), Greedy_Solver(), ILP_Solver(ILP_TIME_LIMIT_SEC)]
+    model = PathScorerGNN(node_feature_dim=4).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=IMITATION_LR)
+    
+    if not os.path.exists(MODEL_PATH):
+        dataset = generate_imitation_dataset(profile_gen, RealisticTSNEnv, num_episodes=IMITATION_DATASET_SIZE)
+        if not dataset:
+            print("데이터셋 생성 실패. 학습을 건너뜁니다.")
+        else:
+            run_imitation_learning(model, optimizer, dataset, epochs=IMITATION_EPOCHS)
+    else:
+        print(f"'{MODEL_PATH}' 발견. 학습을 건너뜁니다.")
+
+    print("\n===== 최종 랜덤 벤치마크 실행 (Path Scorer) =====")
+    solvers = [GNN_Path_Scorer_Solver(MODEL_PATH), Greedy_Solver()]
     results = []
     for i in tqdm(range(BENCHMARK_SCENARIOS), desc="벤치마크", ncols=100):
         profile = profile_gen.generate(); env = RealisticTSNEnv(profile["graph"], profile['flow_definitions'])
@@ -377,15 +311,22 @@ def run_full_procedure_and_benchmark():
             if score <= 0: print(f"Solver {solver.name} failed on scenario {i}: {details.get('error', 'Unknown')}")
             row[f"{solver.name}_Score"], row[f"{solver.name}_Time"] = max(0, score), solver.solve_time
         results.append(row)
+    
     df = pd.DataFrame(results)
     avg_scores = {s.name: df[f"{s.name}_Score"].mean() for s in solvers}; avg_times = {s.name: df[f"{s.name}_Time"].mean() for s in solvers}
+    
     print("\n\n===== 최종 벤치마크 결과 요약 (평균) ====="); print(pd.DataFrame([avg_scores, avg_times], index=["Average Score", "Average Time (s)"]).to_string())
-    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(12, 12), sharex=True)
-    fig.suptitle(f'Realistic Benchmark Results ({BENCHMARK_SCENARIOS} Scenarios)', fontsize=16)
-    pd.DataFrame.from_dict(avg_scores, orient='index', columns=['Score']).plot(kind='bar', y='Score', ax=axes[0], rot=0, legend=False, color=['#3498db', '#f1c40f', '#e74c3c']); axes[0].set_title('Average Performance Score (Higher is Better)'); axes[0].set_ylabel('Avg. Robustness Score'); axes[0].grid(axis='y', linestyle='--', alpha=0.7)
+    
+    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(10, 10), sharex=True)
+    fig.suptitle(f'Path Scorer Benchmark Results ({BENCHMARK_SCENARIOS} Scenarios)', fontsize=16)
+    pd.DataFrame.from_dict(avg_scores, orient='index', columns=['Score']).plot(kind='bar', y='Score', ax=axes[0], rot=0, legend=False, color=['#3498db', '#f1c40f'])
+    axes[0].set_title('Average Performance Score (Higher is Better)'); axes[0].set_ylabel('Avg. Robustness Score'); axes[0].grid(axis='y', linestyle='--', alpha=0.7)
     for c in axes[0].containers: axes[0].bar_label(c, fmt='%.3f')
-    pd.DataFrame.from_dict(avg_times, orient='index', columns=['Time']).plot(kind='bar', y='Time', ax=axes[1], rot=0, legend=False, color=['#3498db', '#f1c40f', '#e74c3c']); axes[1].set_title('Average Computation Time (Lower is Better)'); axes[1].set_ylabel('Avg. Time (seconds)'); axes[1].set_yscale('log'); axes[1].grid(axis='y', linestyle='--', alpha=0.7)
+    
+    pd.DataFrame.from_dict(avg_times, orient='index', columns=['Time']).plot(kind='bar', y='Time', ax=axes[1], rot=0, legend=False, color=['#3498db', '#f1c40f'])
+    axes[1].set_title('Average Computation Time (Lower is Better)'); axes[1].set_ylabel('Avg. Time (seconds)'); axes[1].set_yscale('log'); axes[1].grid(axis='y', linestyle='--', alpha=0.7)
     for c in axes[1].containers: axes[1].bar_label(c, fmt='%.3f')
+    
     plt.tight_layout(rect=[0, 0, 1, 0.96]); plt.savefig(RESULT_PLOT_PATH); print(f"\n결과 그래프가 '{RESULT_PLOT_PATH}'에 저장되었습니다.")
 
 if __name__ == '__main__':
