@@ -96,7 +96,9 @@ class RealisticTSNEnv:
             path = path_pair.get('primary')
             if path and nx.is_path(eval_graph, path):
                 rate_to_add = (self.flow_defs[flow_id]['size_bytes'] * 8) / (self.flow_defs[flow_id]['period_ms'] * 1e-3)
-                for u, v in zip(path[:-1], path[1:]): link_data_rate[tuple(sorted((u,v)))] += rate_to_add
+                for u, v in zip(path[:-1], path[1:]):
+                    edge = tuple(sorted((u,v)))
+                    if edge in link_data_rate: link_data_rate[edge] += rate_to_add
         link_utilization = {edge: rate / eval_graph.edges[edge]['bandwidth'] for edge, rate in link_data_rate.items() if eval_graph.has_edge(*edge)}
         for edge, util in link_utilization.items():
             if util >= 1.0: return -1000, {"error": f"Bandwidth exceeded on link {edge} (util: {util:.2f})"}
@@ -138,20 +140,43 @@ class RealisticTSNEnv:
 class PathScorerGNN(nn.Module):
     def __init__(self, node_feature_dim, hidden_dim=64):
         super().__init__()
-        self.gnn_encoder = nn.Sequential(SAGEConv(node_feature_dim, hidden_dim), nn.ReLU(), SAGEConv(hidden_dim, hidden_dim))
+        self.conv1 = SAGEConv(node_feature_dim, hidden_dim)
+        self.conv2 = SAGEConv(hidden_dim, hidden_dim)
         self.path_encoder = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
-        self.scorer_mlp = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+        self.scorer_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
     def forward(self, network_batch_data, path_node_indices_list):
-        node_embeddings = self.gnn_encoder(network_batch_data.x, network_batch_data.edge_index)
-        graph_embedding = global_mean_pool(node_embeddings, network_batch_data.batch)
+        x, edge_index, batch = network_batch_data.x, network_batch_data.edge_index, network_batch_data.batch
+        
+        # GNN Encoder
+        x = F.relu(self.conv1(x, edge_index))
+        x = self.conv2(x, edge_index)
+        node_embeddings = x
+
+        # Graph-level embedding
+        graph_embedding = global_mean_pool(node_embeddings, batch)
+
         path_scores = []
         for i, path_nodes in enumerate(path_node_indices_list):
+            # Select node embeddings for the current path
             path_node_embeddings = node_embeddings[path_nodes]
+            
+            # Path Encoder (LSTM)
             _, (hn, _) = self.path_encoder(path_node_embeddings.unsqueeze(0))
             path_embedding = hn.squeeze(0)
-            combined_embedding = torch.cat([graph_embedding[i], path_embedding.squeeze(0)], dim=-1)
+            
+            # Combine graph and path embeddings
+            current_graph_embedding = graph_embedding[i]
+            combined_embedding = torch.cat([current_graph_embedding, path_embedding.squeeze(0)], dim=-1)
+            
+            # Score Prediction
             score = self.scorer_mlp(combined_embedding)
             path_scores.append(score)
+            
         return torch.cat(path_scores)
 
 def get_network_state_tensor(graph, partial_paths, all_flow_defs):
@@ -203,11 +228,14 @@ class GNN_Path_Scorer_Solver(BaseSolver):
             except nx.NetworkXNoPath: return None
             if not candidate_paths: continue
             net_state = get_network_state_tensor(graph, partial_paths, all_flow_defs)
-            path_node_indices_list = [torch.tensor(p, dtype=torch.long) for p in candidate_paths]
-            with torch.no_grad(): scores = self.model(Batch.from_data_list([net_state] * len(candidate_paths)), path_node_indices_list)
+            path_node_indices_list = [torch.tensor(p, dtype=torch.long).to(DEVICE) for p in candidate_paths]
+            net_batch = Batch.from_data_list([net_state] * len(candidate_paths)).to(DEVICE)
+            with torch.no_grad():
+                scores = self.model(net_batch, path_node_indices_list)
             best_path_idx = torch.argmax(scores).item()
             p_path = candidate_paths[best_path_idx]
-            backup_graph = graph.copy(); backup_graph.remove_edges_from(list(zip(p_path[:-1], p_path[1:])))
+            backup_graph = graph.copy()
+            if len(p_path) > 1: backup_graph.remove_edges_from(list(zip(p_path[:-1], p_path[1:])))
             b_path = next(itertools.islice(nx.shortest_simple_paths(backup_graph, src, dst), 1), None) if nx.has_path(backup_graph, src, dst) else None
             paths[flow_id] = {'primary': p_path, 'backup': b_path}; partial_paths[flow_id] = paths[flow_id]
         return paths
@@ -225,7 +253,8 @@ class Greedy_Solver(BaseSolver):
                     return 1e9 if util >= 1.0 else 1 + 100 * (util ** 2)
                 p_path = nx.shortest_path(graph, source=props['src'], target=props['dst'], weight=weight_func)
                 for u, v in zip(p_path[:-1], p_path[1:]): link_rates[tuple(sorted((u,v)))] += flow_rate
-                backup_graph = graph.copy(); backup_graph.remove_edges_from(list(zip(p_path[:-1], p_path[1:])))
+                backup_graph = graph.copy()
+                if len(p_path) > 1: backup_graph.remove_edges_from(list(zip(p_path[:-1], p_path[1:])))
                 b_path = nx.shortest_path(backup_graph, source=props['src'], target=props['dst']) if nx.has_path(backup_graph, props['src'], props['dst']) else None
                 paths[flow_id] = {'primary': p_path, 'backup': b_path}
             except (nx.NetworkXNoPath, nx.NetworkXUnfeasible): return None
@@ -255,7 +284,8 @@ def generate_imitation_dataset(profile_generator, env_class, num_episodes):
             if max(candidate_scores) <= 0: continue
             net_state_tensor = get_network_state_tensor(env.graph, partial_paths, profile['flow_definitions'])
             dataset.append({'net_state': net_state_tensor, 'candidates': candidate_paths, 'scores': torch.tensor(candidate_scores, dtype=torch.float)})
-            best_path = candidate_paths[np.argmax(candidate_scores)]
+            best_path_idx = np.argmax(candidate_scores)
+            best_path = candidate_paths[best_path_idx]
             partial_paths[flow_id] = {'primary': best_path}
     return dataset
 
@@ -271,7 +301,8 @@ def run_imitation_learning(model, optimizer, dataset, epochs):
             net_states = [data_point['net_state']] * len(data_point['candidates'])
             path_node_indices = [torch.tensor(p, dtype=torch.long) for p in data_point['candidates']]
             target_scores = data_point['scores'].to(DEVICE)
-            predicted_scores = model(Batch.from_data_list(net_states), path_node_indices)
+            net_batch = Batch.from_data_list(net_states).to(DEVICE)
+            predicted_scores = model(net_batch, path_node_indices)
             loss = loss_fn(predicted_scores, target_scores)
             loss.backward()
             optimizer.step()
@@ -292,7 +323,7 @@ def run_full_procedure_and_benchmark():
     if not os.path.exists(MODEL_PATH):
         dataset = generate_imitation_dataset(profile_gen, RealisticTSNEnv, num_episodes=IMITATION_DATASET_SIZE)
         if not dataset:
-            print("데이터셋 생성 실패. 학습을 건너뜁니다.")
+            print("데이터셋 생성 실패. 유효한 시나리오가 없습니다. 학습을 건너뜁니다.")
         else:
             run_imitation_learning(model, optimizer, dataset, epochs=IMITATION_EPOCHS)
     else:
