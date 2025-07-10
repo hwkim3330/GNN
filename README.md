@@ -1,3 +1,85 @@
+# GNN 기반 현실적 TSN 라우팅 최적화 솔버
+
+## 1. 프로젝트 개요
+
+이 프로젝트는 시간 민감형 네트워크(Time-Sensitive Networking, TSN) 환경에서 데이터 플로우의 경로를 최적화하는 강화학습 기반 솔루션을 제공합니다. 특히, 실제 네트워크 환경과 유사한 조건에서 GNN(Graph Neural Network) 에이전트의 성능을 극대화하는 데 초점을 맞춥니다.
+
+GraphSAGE 모델과 PPO(Proximal Policy Optimization) 알고리즘을 사용하여, 속도가 빠른 Greedy 알고리즘과 성능이 우수한 ILP(Integer Linear Programming)의 장점을 결합하고자 합니다. 최종 목표는 ILP에 준하는 높은 품질의 라우팅 해를 Greedy처럼 빠른 속도로 찾아내는 것입니다.
+
+## 2. 핵심 기능
+
+-   **현실적인 네트워크 토폴로지**: 데이터센터에서 널리 사용되는 **팻-트리(Fat-Tree)** 토폴로지를 생성하고, 계층별로 차등적인 링크 대역폭을 설정합니다.
+-   **현실적인 트래픽 프로파일**: 특정 서버로 트래픽이 몰리는 **핫스팟(Hotspot)** 현상과 예측 불가능한 **배경 트래픽(Best-Effort)**을 시뮬레이션합니다.
+-   **현실적인 고장 시나리오**: 단순 링크 고장뿐만 아니라, 네트워크에 더 큰 영향을 미치는 **스위치(노드) 고장** 상황을 포함하여 모델의 견고성을 평가합니다.
+-   **CPU 최적화 모델**: Intel CPU 환경에서의 빠른 연산을 위해 어텐션 기반 GAT 대신 집계 기반 **GraphSAGE** 모델을 채택했습니다.
+-   **고도화된 강화학습**: ILP 솔루션을 전문가 삼아 모방 학습을 수행한 뒤, PPO 알고리즘을 통해 실제 환경의 복합적인 보상(지연시간, 공정성, 자원 효율성)을 최대화하도록 온라인 학습을 진행합니다.
+-   **종합적인 성능 벤치마크**: 개발된 GNN 솔루션을 Greedy 및 ILP와 **성능, 계산 시간, 견고성** 측면에서 비교하고 결과를 시각화합니다.
+
+## 3. 시스템 요구사항
+
+-   Python 3.8 이상
+-   PyTorch
+-   `pulp` 라이브러리와 CBC Solver (pulp 설치 시 대부분 자동으로 설치됨)
+
+## 4. 설치 가이드
+
+1.  **프로젝트 파일 준비**
+    -   이 프로젝트의 파이썬 코드(`main.py`)와 `requirements.txt`, `README.md` 파일을 하나의 디렉토리에 저장합니다.
+
+2.  **가상 환경 생성 및 활성화 (권장)**
+    ```bash
+    python -m venv venv
+    # Windows
+    .\venv\Scripts\activate
+    # macOS / Linux
+    source venv/bin/activate
+    ```
+
+3.  **PyTorch 설치 (CPU 버전)**
+    -   시스템에 맞는 PyTorch 설치 명령어는 [PyTorch 공식 홈페이지](https://pytorch.org/get-started/locally/)에서 확인하는 것이 가장 정확합니다.
+    -   일반적인 CPU 버전 설치 명령어는 다음과 같습니다.
+    ```bash
+    pip install torch torchvision torchaudio
+    ```
+
+4.  **PyG (PyTorch Geometric) 설치**
+    -   PyG는 PyTorch 버전에 맞춰 설치해야 합니다. 아래 명령어는 PyTorch 2.0 이상 버전에 해당합니다.
+    -   자세한 내용은 [PyG 설치 가이드](https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html)를 참조하세요.
+    ```bash
+    pip install torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.0.0+cpu.html
+    pip install torch_geometric
+    ```
+
+5.  **나머지 라이브러리 설치**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+## 5. 실행 방법
+
+1.  터미널에서 아래 명령어를 실행하여 전체 학습 및 벤치마크 파이프라인을 시작합니다.
+    ```bash
+    python main.py
+    ```
+    (여기서 `main.py`는 제공된 파이썬 스크립트의 파일명입니다.)
+
+2.  **실행 과정**:
+    -   **1단계 (모방 학습)**: `IMITATION_MODEL_PATH`에 저장된 모델이 없으면, ILP 솔버를 전문가로 하여 모방 학습을 진행하고 결과를 저장합니다.
+    -   **2단계 (온라인 학습)**: 모방 학습으로 초기화된 모델을 PPO 알고리즘으로 추가 학습시키고, 최종 모델을 `FINAL_MODEL_PATH`에 저장합니다.
+    -   **3단계 (벤치마크)**: 최종 학습된 GNN 모델을 Greedy, ILP와 함께 벤치마크합니다.
+    -   콘솔에 최종 성능 요약 테이블이 출력되고, 실행 결과 그래프가 `RESULT_PLOT_PATH`에 지정된 파일명(`benchmark_results_graphsage_realistic.png`)으로 저장됩니다.
+
+## 6. 코드 구조
+
+-   `RealisticProfileGenerator`: 팻-트리 토폴로지, 핫스팟 트래픽 등 현실적인 시나리오 프로파일을 생성합니다.
+-   `RealisticTSNEnv`: 현실적인 제약 조건(계층별 대역폭, 노드 고장)과 복합적인 평가 지표(지연시간, 공정성, 자원 효율성)를 포함하는 시뮬레이션 환경입니다.
+-   `ActorCriticSAGE`: GraphSAGE를 기반으로 한 Actor-Critic 신경망 모델입니다.
+-   `SAGE_PPOAgent`: PPO 알고리즘을 사용하여 `ActorCriticSAGE` 모델을 학습시키는 에이전트입니다.
+-   `GNN_SAGE_Solver`, `Greedy_Solver`, `ILP_Solver`: 벤치마크에 사용될 세 가지 솔버 클래스입니다.
+-   `run_imitation_learning`, `run_ppo_guided_rl`: 각 학습 단계를 수행하는 함수입니다.
+-   `run_full_procedure_and_benchmark`: 전체 파이프라인을 실행하고 결과를 보고하는 메인 함수입니다.
+
+
  
 # GNN-based Reinforcement Learning for Robust TSN Routing
 
