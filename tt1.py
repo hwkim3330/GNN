@@ -22,7 +22,7 @@ os.environ['OMP_NUM_THREADS'] = '8'; os.environ['MKL_NUM_THREADS'] = '8'; torch.
 
 IMITATION_EPOCHS = 50
 IMITATION_DATASET_SIZE = 200 # ILP가 느리므로 데이터셋 크기 조절
-ONLINE_EPISODES = 10000
+ONLINE_EPISODES = 1000
 IMITATION_LR = 1e-4
 ONLINE_LR = 3e-5
 ILP_TIME_LIMIT_SEC = 60
@@ -405,3 +405,4 @@ def run_full_procedure_and_benchmark():
 
 if __name__ == '__main__':
     run_full_procedure_and_benchmark()
+
